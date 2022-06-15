@@ -1,0 +1,198 @@
+--------------------------------------------------------- 창고 자동부여 로직
+--1. 빈 공간 찾기 (TB_ITM_LOC_HIS와 TB_CD_ITM_LOC 비교해서 일치하지 않는것 중 제일 1번째 것 조회)
+--2. LOC가 부여되지 않은 GR찾기 (부여된 GR번호는 더 이상 조회되지 않음)
+--3. 같은 납품처끼리 RNK번호(납품처 그룹번호)로 묶기 (납기일은 파라메터로 넘기기) -> 최상위 그룹번호에 해당하는 GR번호만 LOC부여, 
+--4. 25000KG가 넘지 않도록 제한하기(무게 자동증가 쿼리 적용 후 25000KG까지만 조회하도록 제한)
+--5. 빈 공간 중 1번째 것만 조회하고 이것을 2~4번에 해당하는 GR에 일괄적으로 부여
+-- + LOC에는 데이터가 INSERT되는 순간 1번 조건에 위배되어 다음 공간이 1번째로 조회되고 RNK번호에 관계없이 중복으로 부여되지 않음
+-- + 최상위 RNK번호를 가진 GR번호에 LOC정보가 할당되는 순간 2번 조건에 위배되어 다른 납품처에 같은 LOC가 부여될 수 없음
+-- 6. 출고된 공간은 다시 빈 공간으로써 활용되어야 함 
+-- 7. ITM에 대한 입출고 기록이 남아있어야 함
+-----------------------------------------------------------------------------------
+--------------------------------------------------------- LOC가 부여된 GR조회
+DECLARE @LOC_GR TABLE
+(
+ CHNL_CD VARCHAR(25)
+,CNTR_NM NVARCHAR(500)
+,RLSE_CMD_NO VARCHAR(100)
+)
+-------------------------------
+------------------------------- 
+INSERT INTO @LOC_GR
+SELECT 
+       F1.CHNL_CD
+  ,F1.CNTR_NM
+  ,F1.RLSE_CMD_NO
+  FROM TB_SL_RLSE_DTL F1, TB_ITM_LOC_HIS F2
+WHERE 1=1
+AND F1.CHNL_CD = 'C210914-ROBO'
+AND F1.CHNL_CD = F2.CHNL_CD
+AND F1.RLSE_CMD_NO IS NOT NULL 
+AND F1.RLSE_CMD_NO = F2.RLSE_CMD_NO
+AND F2.IO_CD = 'I'                                                  
+
+-------------------------------
+-------------------------------
+DECLARE @GROUP_GR_2 TABLE
+(
+CNTR_NM NVARCHAR(500)
+,RLSE_CMD_NO VARCHAR(100)
+,SL_ITM_WGT NUMERIC(18,0)
+,IN_REQ_DT DATETIME
+,CNTR_PSN_NM NVARCHAR(500)
+)
+-------------------------------
+------------------------------- 전체 GR에서 LOC가 부여된 GR, 납품처가 없는 GR, 같은 납기일(파라메터), 납기일이 없는 GR을 제외하고 조회
+
+INSERT INTO @GROUP_GR_2 
+SELECT 
+    b.CNTR_NM
+  , b.RLSE_CMD_NO
+  , b.SL_ITM_WGT
+      , b.IN_REQ_DT 
+ -- , (SELECT X1.IO_CD FROM TB_ITM_LOC_HIS X1 WHERE 1=1 AND X1.RLSE_CMD_NO = b.RLSE_CMD_NO AND X1.IO_CD ='NULL') AS IO_CD  --입출고 기록이 없는 것 조회
+  , b.CNTR_PSN_NM
+FROM TB_SL_RLSE_DTL b
+WHERE 1=1
+AND b.CHNL_CD = 'C210914-ROBO' 
+AND b.CNTR_NM IS NOT NULL
+AND b.IN_REQ_DT IS NOT NULL                                
+AND b.RLSE_CMD_NO NOT IN (SELECT RLSE_CMD_NO FROM @LOC_GR) -- 전체 GR에서 LOC가 부여된 GR제외하고 조회
+--AND IN_REQ_DT = #IN_REQ_DT# -------------------------------------------날짜 파라메터(여기서 필터링 된 것을 기준으로 납품처, 무게 순으로 RNK번호 부여)
+
+
+
+-------------------------------같은 납품처를 기준으로 GR번호를 RNK번호로 묶음, + RNK번호 순으로 정렬
+-------------------------------
+DECLARE @GROUP_GR_1 TABLE
+(
+CNTR_NM NVARCHAR(500)
+,RLSE_CMD_NO VARCHAR(100)
+,SL_ITM_WGT NUMERIC(18,0)
+,IN_REQ_DT DATETIME
+,ROW_ INT
+,RNK INT
+)
+-------------------------------
+-------------------------------
+INSERT INTO @GROUP_GR_1
+SELECT 
+	    b.CNTR_NM
+	  , b.RLSE_CMD_NO
+	  , b.SL_ITM_WGT
+          , b.IN_REQ_DT
+	  , ROW_NUMBER() OVER(ORDER BY b.CNTR_NM) AS ROW_             -- 일괄적으로 번호부여(중량 자동증가 기능에 필요)
+	  , DENSE_RANK() OVER (ORDER BY b.CNTR_NM) AS RNK             -- 납품처 기준으로 그룹번호 부여
+	  
+FROM @GROUP_GR_2 b
+WHERE 1=1
+AND b.CNTR_NM IS NOT NULL
+AND b.IN_REQ_DT IS NOT NULL
+ORDER BY RNK
+
+---------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------
+DECLARE @GROUP_FINAL TABLE         ----@GROUP_GR_1의 테이블에서 무게 증가 기능 추가 (-@GROUP_GR_1 에서 조회된 것을 기준으로 계산하기 때문에 ROW정렬 기준이 변해도 계산에 문제 없음)
+(                                  ----
+
+ RLSE_CMD_NO VARCHAR(100)
+,CNTR_NM NVARCHAR(500)
+,SL_ITM_WGT NUMERIC(18,0)
+,WGT NUMERIC(18,0)
+,IN_REQ_DT DATETIME
+,ROW_ INT
+,RNK INT
+)
+--------------------------------------------------------------
+--------------------------------------------------------------
+INSERT INTO @GROUP_FINAL
+SELECT
+	    RLSE_CMD_NO
+	  , T1.CNTR_NM
+	  , T1.SL_ITM_WGT
+	  , (SELECT SUM(T2.SL_ITM_WGT) FROM @GROUP_GR_1 T2 WHERE T2.ROW_ <= T1.ROW_) AS WGT  --중량 자동 증가 (주의:ROW기준이 명확하지 않으면 데이터 이상하게 계산될 수 있음)
+      , T1.IN_REQ_DT
+	  , T1.ROW_
+	  ,T1.RNK
+FROM @GROUP_GR_1 T1
+WHERE 1=1
+ORDER BY ROW_
+
+--SELECT * FROM @GROUP_FINAL
+--------------------------------------------------
+--------------------------------------------------빈 공간 찾기
+DECLARE @LOC_SPACE TABLE
+(
+   CHNL_CD VARCHAR(25)
+  ,AREA_CD VARCHAR(20)
+  ,N1ST_LOC_ID VARCHAR(100)
+  ,N2ND_LOC_ID VARCHAR(100)
+  --,IO_CD VARCHAR(1)
+)
+-------------------------------------------------
+-------------------------------------------------
+              INSERT INTO @LOC_SPACE			
+				 SELECT 
+			           CHNL_CD
+			          ,AREA_CD
+		                  ,N1ST_LOC_ID
+				  ,N2ND_LOC_ID
+				FROM TB_CD_ITM_LOC T1
+		WHERE 1=1
+		AND CHNL_CD = 'C210914-ROBO'	
+		                EXCEPT                  -------------입고된 LOC제외조건
+		                 SELECT           
+				   CHNL_CD
+				  ,AREA_CD
+				  ,N1ST_LOC_ID
+				  ,N2ND_LOC_ID
+		FROM TB_ITM_LOC_HIS 
+		WHERE 1=1
+		AND CHNL_CD = 'C210914-ROBO'		
+		AND IO_CD = 'I'------------------------------------------------현재 입고되어있는 정보만 필터링(해당 기준이 없으면 LOC_HIS테이블에 NULL값인 것만 조회)
+---------------------------------------------------------------
+--------------------------------------------------------------- 빈 공간 중에서 상위 1줄의 LOC정보만 가져오기
+DECLARE @LOC_SPACE_TOP1 TABLE
+(
+   CHNL_CD VARCHAR(25)
+  ,AREA_CD VARCHAR(20)
+  ,N1ST_LOC_ID VARCHAR(100)
+  ,N2ND_LOC_ID VARCHAR(100)
+)
+
+INSERT INTO @LOC_SPACE_TOP1
+SELECT TOP 1 
+     CHNL_CD
+	,AREA_CD
+	,N1ST_LOC_ID
+	,N2ND_LOC_ID
+FROM @LOC_SPACE
+
+--SELECT * FROM @LOC_SPACE_TOP1
+
+-------------------------------------------------
+------------------------------------------------- 인서트 해야 할 것(최상위 RNK 그룹 중에서 무게가 25000이하인 것 + 최상위 LOC정보)
+
+--BEGIN TRAN
+--INSERT INTO TB_ITM_LOC_HIS
+SELECT 
+         X2.CHNL_CD
+		,X2.AREA_CD
+		,X1.CNTR_NM AS ITM_CD
+		,ROW_NUMBER() OVER(ORDER BY X1.WGT) AS LOC_SEQ
+        ,X1.RLSE_CMD_NO
+		,NULL AS OPMZ_NO
+		,NULL AS STEP_NO
+		,NULL AS STEP_SEQ
+		,X2.N1ST_LOC_ID
+		,X2.N2ND_LOC_ID
+		,'ROBO' AS CRE_USR_ID
+		,'ROBO' AS UPD_USR_ID
+	    ,GETDATE() AS CRE_DT
+		,GETDATE() AS UPD_DT
+		,X1.SL_ITM_WGT AS LOC_WGT
+		,'I' AS IO_CD
+FROM @LOC_SPACE_TOP1 X2, @GROUP_FINAL X1
+WHERE 1=1
+--AND X1.WGT < 25000
+AND X1.RNK = '1'
